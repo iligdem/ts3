@@ -4,6 +4,10 @@ import yaml
 import pandas as pd
 import numpy as np
 from IPython.display import display
+from neuralforecast import NeuralForecast
+from neuralforecast.models import PatchTST  # NBEATS удалён
+from sklearn.linear_model import LinearRegression
+from statsmodels.tsa.stattools import acf
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,28 +18,26 @@ from src.models import (
     naive_forecast, seasonal_naive_forecast, train_ets, train_theta,
     train_catboost_global, prepare_catboost_data, catboost_predict_global,
     train_neural_model, predict_neural_model,
-    train_catboost_on_series, catboost_predict,
-    compute_series_features  # we need to define this
+    train_catboost_on_series, catboost_predict
 )
-from src.ensemble import stacking_catboost_theta, stacking_catboost_seasonalnaive, stacking_neural
+from src.ensemble import stacking_catboost_theta, stacking_catboost_seasonalnaive  # stacking_neural удалён
+from statsmodels.tsa.stattools import acf
 
 def compute_series_features(series, freq, seasonality):
-    from statsmodels.tsa.stattools import acf
-    feat = {}
-    feat['length'] = len(series)
-    feat['mean'] = np.mean(series)
-    feat['std'] = np.std(series)
-    feat['min'] = np.min(series)
-    feat['max'] = np.max(series)
+    features = {}
+    features['length'] = len(series)
+    features['mean'] = np.mean(series)
+    features['std'] = np.std(series)
+    features['min'] = np.min(series)
+    features['max'] = np.max(series)
     if len(series) > 1:
-        feat['acf1'] = acf(series, nlags=1, fft=False)[1]
+        features['acf1'] = acf(series, nlags=1, fft=False)[1]
     else:
-        feat['acf1'] = 0
-    feat['seasonality'] = seasonality[freq]
-    return feat
+        features['acf1'] = 0
+    features['seasonality'] = seasonality[freq]
+    return features
 
 def step3_baselines(config):
-    """Run baselines on windows and return results DataFrame."""
     windows = load_windows(config)
     results = []
     for win in windows:
@@ -44,20 +46,16 @@ def step3_baselines(config):
         horizon = win['horizon']
         season = config['seasonality'][win['freq']]
 
-        # Naive
         pred = naive_forecast(train, horizon)
         results.append(('Naive', win, smape(val, pred), mase(val, pred, train, season)))
 
-        # Seasonal Naive
         pred = seasonal_naive_forecast(train, horizon, season)
         results.append(('SeasonalNaive', win, smape(val, pred), mase(val, pred, train, season)))
 
-        # AutoETS
         pred = train_ets(train, horizon, win['freq'], config['seasonality'])
         if not np.any(np.isnan(pred)):
             results.append(('AutoETS', win, smape(val, pred), mase(val, pred, train, season)))
 
-        # Theta
         pred = train_theta(train, horizon, win['freq'], config['seasonality'])
         if not np.any(np.isnan(pred)):
             results.append(('Theta', win, smape(val, pred), mase(val, pred, train, season)))
@@ -72,11 +70,9 @@ def step3_baselines(config):
     return df
 
 def step4_global_models(config):
-    """Train CatBoost and PatchTST on windows and compare."""
     windows = load_windows(config)
     from src.models import FEATURE_KEYS, create_features
 
-    # Group by freq
     windows_by_freq = {f: [] for f in config['seasonality']}
     for w in windows:
         windows_by_freq[w['freq']].append(w)
@@ -156,7 +152,6 @@ def step4_global_models(config):
     display(df_pt.groupby('model').agg(smape_mean=('smape','mean'), smape_std=('smape','std'),
                                         mase_mean=('mase','mean'), mase_std=('mase','std')).reset_index())
 
-    # Combined
     all_res = pd.concat([df_cb, df_pt], ignore_index=True)
     comp = all_res.groupby('model').agg(
         smape_mean=('smape','mean'), smape_std=('smape','std'),
@@ -166,9 +161,7 @@ def step4_global_models(config):
     display(comp)
 
 def step5_simple_ensembles(config):
-    """Run step 5: individual models, simple avg, stacking with CatBoost+SeasonalNaive."""
     from src.models import train_catboost_on_series, catboost_predict, seasonal_naive_forecast
-    from src.ensemble import stacking_catboost_seasonalnaive
     meta = pd.read_csv(os.path.join(config['data_dir'], "series_horizons.csv"))
     results = {'model': [], 'freq': [], 'series_id': [], 'smape': [], 'mase': []}
 
@@ -178,7 +171,6 @@ def step5_simple_ensembles(config):
         horizon = meta[meta['frequency'] == freq]['horizon'].iloc[0]
         series_ids = train_df['id'].tolist()
 
-        # Prepare data
         train_dict = {}
         test_dict = {}
         full_dict = {}
@@ -200,6 +192,7 @@ def step5_simple_ensembles(config):
             model = train_catboost_on_series(train_series, horizon, config['catboost_params'])
             if model is not None:
                 pred = catboost_predict(model, train_series, horizon)
+                pred = np.asarray(pred, dtype=float)
                 if not np.any(np.isnan(pred)):
                     pred_cb_test[sid] = pred
 
@@ -219,7 +212,7 @@ def step5_simple_ensembles(config):
         for sid in train_dict:
             rows = preds_df[preds_df['unique_id']==sid].sort_values('ds')['PatchTST'].values
             if len(rows) >= horizon:
-                pred_ptst_test[sid] = rows[:horizon]
+                pred_ptst_test[sid] = np.asarray(rows[:horizon], dtype=float)
 
         # Collect metrics
         for sid in train_dict:
@@ -250,10 +243,6 @@ def step5_simple_ensembles(config):
                 results['mase'].append(mase(true, avg, train_series, season))
 
         # Stacking CatBoost + SeasonalNaive
-        # (simplified: use the function from ensemble)
-        # We'll just reuse the logic, but we need to collect stacking preds similarly
-        # For simplicity, we can call a function that returns stacking_preds and then evaluate
-        # Let's implement directly:
         X_stack, y_stack = [], []
         for sid in train_dict:
             train_series = train_dict[sid]
@@ -266,9 +255,11 @@ def step5_simple_ensembles(config):
             if cb_model_val is None:
                 continue
             pred_cb_val = catboost_predict(cb_model_val, train_part, horizon)
+            pred_cb_val = np.asarray(pred_cb_val, dtype=float)
             if np.any(np.isnan(pred_cb_val)):
                 continue
             pred_sn_val = seasonal_naive_forecast(train_part, horizon, config['seasonality'][freq])
+            pred_sn_val = np.asarray(pred_sn_val, dtype=float)
             for t in range(horizon):
                 X_stack.append([pred_cb_val[t], pred_sn_val[t]])
                 y_stack.append(val_part[t])
@@ -282,7 +273,8 @@ def step5_simple_ensembles(config):
                 if sid not in pred_cb_test:
                     continue
                 pred_sn_test = seasonal_naive_forecast(train_dict[sid], horizon, config['seasonality'][freq])
-                pred_cb_i = pred_cb_test[sid]
+                pred_sn_test = np.asarray(pred_sn_test, dtype=float)
+                pred_cb_i = np.asarray(pred_cb_test[sid], dtype=float)
                 if not np.any(np.isnan(pred_cb_i)) and not np.any(np.isnan(pred_sn_test)):
                     stack_pred = np.zeros(horizon)
                     for t in range(horizon):
@@ -302,63 +294,7 @@ def step5_simple_ensembles(config):
     display(agg)
     return df
 
-def step6_neural_ensemble(config):
-    """Run neural ensemble (PatchTST + N-BEATS) with CV stacking."""
-    from src.ensemble import stacking_neural
-    meta = pd.read_csv(os.path.join(config['data_dir'], "series_horizons.csv"))
-    all_results = []
-
-    for freq in ['Yearly', 'Quarterly', 'Monthly']:
-        print(f"\nProcessing {freq}")
-        train_df, test_df = load_freq_data(config, freq)
-        horizon = meta[meta['frequency'] == freq]['horizon'].iloc[0]
-
-        train_dict, test_dict, full_dict = {}, {}, {}
-        for sid in train_df['id'].tolist():
-            tr = train_df[train_df['id']==sid].iloc[0,1:].dropna().values
-            te = test_df[test_df['id']==sid].iloc[0,1:].dropna().values
-            if len(tr) < 2*horizon:
-                continue
-            train_dict[sid] = tr
-            test_dict[sid] = te[:horizon]
-            full_dict[sid] = tr
-
-        if not train_dict:
-            continue
-
-        pt_test, nb_test, stacking, valid = stacking_neural(config, train_dict, test_dict, full_dict, freq, horizon)
-        if pt_test is None:
-            continue
-
-        for sid in full_dict:
-            true = test_dict[sid]
-            tr = full_dict[sid]
-            seas = config['seasonality'][freq]
-
-            if sid in pt_test and not np.any(np.isnan(pt_test[sid])):
-                all_results.append(('PatchTST', freq, sid, smape(true, pt_test[sid]), mase(true, pt_test[sid], tr, seas)))
-            if sid in nb_test and not np.any(np.isnan(nb_test[sid])):
-                all_results.append(('NBEATS', freq, sid, smape(true, nb_test[sid]), mase(true, nb_test[sid], tr, seas)))
-            if sid in pt_test and sid in nb_test and not (np.any(np.isnan(pt_test[sid])) or np.any(np.isnan(nb_test[sid]))):
-                avg = (pt_test[sid] + nb_test[sid]) / 2
-                all_results.append(('SimpleAvg', freq, sid, smape(true, avg), mase(true, avg, tr, seas)))
-            if sid in stacking:
-                all_results.append(('Stacking', freq, sid, smape(true, stacking[sid]), mase(true, stacking[sid], tr, seas)))
-
-    if all_results:
-        df = pd.DataFrame(all_results, columns=['model','freq','series_id','smape','mase'])
-        agg = df.groupby('model').agg(
-            smape_mean=('smape','mean'), smape_std=('smape','std'),
-            mase_mean=('mase','mean'), mase_std=('mase','std')
-        ).reset_index()
-        print("\n=== Neural ensemble results (PatchTST + N-BEATS) ===")
-        display(agg)
-        return df
-    else:
-        return None
-
 def step7_final_stacking(config):
-    """Final stacking: PatchTST + Theta + series features, with CatBoost meta-model."""
     from src.ensemble import stacking_catboost_theta
     meta = pd.read_csv(os.path.join(config['data_dir'], "series_horizons.csv"))
     all_results = []
@@ -368,7 +304,7 @@ def step7_final_stacking(config):
         train_df, test_df = load_freq_data(config, freq)
         horizon = meta[meta['frequency'] == freq]['horizon'].iloc[0]
 
-        min_len = {'Yearly':6, 'Quarterly':12, 'Monthly':24}[freq]
+        min_len = {'Yearly':6, 'Quarterly':12, 'Monthly':18}[freq]
         train_dict, test_dict, full_dict, feat_dict = {}, {}, {}, {}
         for sid in train_df['id'].tolist():
             tr = train_df[train_df['id']==sid].iloc[0,1:].dropna().values
@@ -380,14 +316,19 @@ def step7_final_stacking(config):
             full_dict[sid] = tr
             feat_dict[sid] = compute_series_features(tr, freq, config['seasonality'])
 
+        print(f"  After min_len filter: {len(train_dict)} series")
         if not train_dict:
+            print(f"  WARNING: no series passed min_len filter for {freq}")
             continue
 
         pt_test, th_test, stacking, valid, scaler = stacking_catboost_theta(
             config, train_dict, test_dict, full_dict, feat_dict, freq, horizon
         )
         if pt_test is None:
+            print(f"  WARNING: stacking_catboost_theta returned None for {freq} – no valid stacking models")
             continue
+        else:
+            print(f"  stacking_catboost_theta succeeded: {len(valid)} valid series")
 
         for sid in full_dict:
             true = test_dict[sid]
@@ -404,6 +345,7 @@ def step7_final_stacking(config):
             if sid in stacking:
                 all_results.append(('Stacking', freq, sid, smape(true, stacking[sid]), mase(true, stacking[sid], tr, seas)))
 
+      
     if all_results:
         df = pd.DataFrame(all_results, columns=['model','freq','series_id','smape','mase'])
         agg = df.groupby('model').agg(
@@ -412,8 +354,16 @@ def step7_final_stacking(config):
         ).reset_index()
         print("\n=== FINAL STACKING RESULTS (PatchTST + Theta + features) ===")
         display(agg)
+
+        results_dir = config.get('results_dir', './results')
+        os.makedirs(results_dir, exist_ok=True)
+        df.to_csv(os.path.join(results_dir, 'step7_results.csv'), index=False)
+        agg.to_csv(os.path.join(results_dir, 'step7_aggregated.csv'), index=False)
+        print(f"Results saved to {results_dir}")
+
         return df
     else:
+        print("\nWARNING: no results collected in step7_final_stacking")
         return None
 
 def load_freq_data(config, freq):
@@ -428,20 +378,12 @@ def run_experiment(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    # Step 1
     load_and_sample_data(config)
-    # Step 2
     create_validation_windows(config)
-    # Step 3
     step3_baselines(config)
-    # Step 4
     step4_global_models(config)
-    # Step 5
     step5_simple_ensembles(config)
-    # Step 6 neural
-    step6_neural_ensemble(config)
-    # Step 7 final
-    step7_final_stacking(config)
+    step7_final_stacking(config)  
 
 if __name__ == "__main__":
     import sys

@@ -37,6 +37,7 @@ def train_catboost_global(X, y, params):
     model.fit(X, y)
     return model
 
+
 def catboost_predict_global(model, train_series, horizon, max_lag=6):
     if len(train_series) < max_lag:
         return np.full(horizon, np.nan)
@@ -78,26 +79,58 @@ def train_neural_model(train_dict, horizon, model_class, params):
         for t, v in enumerate(vals):
             rows.append({'unique_id': sid, 'ds': t, 'y': v})
     df = pd.DataFrame(rows)
-    nf = NeuralForecast(models=[model_class(h=horizon, **params)], freq=1)
-    nf.fit(df=df)
-    return nf
-
+    try:
+        nf = NeuralForecast(models=[model_class(h=horizon, **params)], freq=1)
+        nf.fit(df=df)
+        print(f"      train_neural_model: success, model {model_class.__name__} trained on {len(train_dict)} series")
+        return nf
+    except Exception as e:
+        print(f"      train_neural_model exception: {e}")
+        return None
 def predict_neural_model(nf, train_series, sid, horizon):
+    print(f"        predict_neural_model: sid={sid}, len(train_series)={len(train_series)}, horizon={horizon}")
+    y_tr = pd.Series(train_series).astype(float)
     new_df = pd.DataFrame({
         'unique_id': [sid] * len(train_series),
         'ds': range(len(train_series)),
-        'y': train_series
+        'y': y_tr
     })
+    print(f"        new_df shape: {new_df.shape}, head:\n{new_df.head(2)}")
     try:
         preds = nf.predict(df=new_df)
+        print(f"        preds type: {type(preds)}")
+        if preds is not None:
+            print(f"        preds shape: {preds.shape if hasattr(preds, 'shape') else 'N/A'}")
+            print(f"        preds columns: {preds.columns.tolist() if hasattr(preds, 'columns') else 'N/A'}")
+        else:
+            print(f"        preds is None")
+            return np.full(horizon, np.nan)
         model_name = nf.models[0].__class__.__name__
+        print(f"        model_name: {model_name}")
         if not preds.empty and model_name in preds.columns:
             vals = preds[model_name].values[:horizon]
-            if len(vals) == horizon:
+            print(f"        vals shape: {vals.shape}, first few: {vals[:3]}")
+            if len(vals) == horizon and not np.any(np.isnan(vals)):
+                print(f"        success for {sid}")
                 return vals
-    except Exception:
-        pass
+            else:
+                print(f"        invalid vals: len={len(vals)}, has NaN={np.any(np.isnan(vals))}")
+        else:
+            print(f"        empty preds or missing column")
+    except Exception as e:
+        print(f"        EXCEPTION in predict_neural_model for {sid}: {e}")
+        import traceback
+        traceback.print_exc()
     return np.full(horizon, np.nan)
+
+# Специализированные обёртки для PatchTST
+def train_patchtst_global(train_dict, horizon, params):
+    """Обучает глобальную модель PatchTST через train_neural_model."""
+    return train_neural_model(train_dict, horizon, PatchTST, params)
+
+def predict_patchtst(nf, train_series, sid, horizon):
+    """Предсказание с помощью обученной модели PatchTST через predict_neural_model."""
+    return predict_neural_model(nf, train_series, sid, horizon)
 
 # ----- Theta helpers -----
 def train_theta(series, horizon, freq, seasonality):
@@ -106,8 +139,13 @@ def train_theta(series, horizon, freq, seasonality):
         forecaster = ThetaForecaster(sp=sp)
         forecaster.fit(series)
         pred = forecaster.predict(fh=np.arange(1, horizon+1))
-        return pred.values
-    except Exception:
+        # pred уже numpy array, не вызываем .values
+        if np.any(np.isnan(pred)):
+            print(f"      train_theta: NaN in prediction for series of length {len(series)}, freq {freq}, using fallback")
+            return np.full(horizon, series[-1])
+        return pred
+    except Exception as e:
+        print(f"      train_theta exception: {e}, using fallback")
         return np.full(horizon, series[-1])
 
 # ----- ETS helpers -----
